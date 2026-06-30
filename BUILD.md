@@ -37,14 +37,12 @@ git apply /path/to/blender-ipad-unofficial/patches/blender-ipad.patch
 cp /path/to/blender-ipad-unofficial/ios/icon/blender_icon.icns \
    release/ios/Blender.app/Assets/blender_icon.icns
 
-# 5. Configure an iOS Xcode build. These flags are from a known-good local CMakeCache
-#    (Xcode 16.4 / iPhoneOS 18.5 SDK / arm64 / deployment target iPadOS 16).
+# 5. Configure an iOS Xcode build. APPLE_TARGET_DEVICE=ios sets up the whole iOS toolchain
+#    (cross-compile, arm64, SDK, deployment target). Do NOT also pass CMAKE_SYSTEM_NAME /
+#    CMAKE_OSX_* by hand — that can break the iOS Python library detection.
 cmake -S . -B ~/build_ios_xcode -G Xcode \
-  -DWITH_APPLE_CROSSPLATFORM=ON \
   -DAPPLE_TARGET_DEVICE=ios \
-  -DCMAKE_SYSTEM_NAME=iOS \
-  -DCMAKE_OSX_ARCHITECTURES=arm64 \
-  -DCMAKE_OSX_DEPLOYMENT_TARGET=16.00
+  -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO
 
 # 6. Build + repackage into an .ipa (this step is known-good and scripted)
 cd ~/build_ios_xcode
@@ -61,10 +59,10 @@ GitHub Release.
 
 ## Notes
 
-- The CMake flags above come from a working local build (Xcode 16.4, iPhoneOS 18.5 SDK); a
-  different Xcode may need a different SDK / deployment target. The cloud CI
-  ([.github/workflows/build-ipa.yml](.github/workflows/build-ipa.yml)) mirrors this recipe and is
-  adapted from the proven community workflow at https://github.com/Toemeler/blender-iOS-ipa.
+- `APPLE_TARGET_DEVICE=ios` configures the whole iOS toolchain; overriding `CMAKE_SYSTEM_NAME`
+  or `CMAKE_OSX_*` by hand can break iOS Python detection. The cloud CI
+  ([.github/workflows/build-ipa.yml](.github/workflows/build-ipa.yml)) uses the same minimal
+  config, adapted from https://github.com/Toemeler/blender-iOS-ipa.
 - The patch touches input handling (`GHOST_WindowIOS.mm`), two editor files, the Apple CMake
   platform file, and the iOS `Info.plist` (branding). See [CHANGES.md](CHANGES.md).
 - **App icon:** iOS ignores the bundle's `.icns`, so the build injects PNG icons + `CFBundleIcons`

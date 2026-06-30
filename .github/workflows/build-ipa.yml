@@ -64,12 +64,11 @@ jobs:
 
       - name: Configure (iOS, Xcode generator)
         run: |
+          # APPLE_TARGET_DEVICE=ios sets up the whole iOS toolchain (cross-compile, arm64,
+          # SDK, deployment target, Python paths). Do NOT also pass CMAKE_SYSTEM_NAME /
+          # CMAKE_OSX_* by hand — that breaks the iOS Python library detection.
           cmake -S blender -B build_ios -G Xcode \
-            -DWITH_APPLE_CROSSPLATFORM=ON \
             -DAPPLE_TARGET_DEVICE=ios \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.00 \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="" \
