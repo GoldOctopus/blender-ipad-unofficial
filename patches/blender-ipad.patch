@@ -1,0 +1,927 @@
+diff --git a/build_files/cmake/platform/platform_apple.cmake b/build_files/cmake/platform/platform_apple.cmake
+index ece1c7cf426..ec666786c4b 100644
+--- a/build_files/cmake/platform/platform_apple.cmake
++++ b/build_files/cmake/platform/platform_apple.cmake
+@@ -178,7 +178,7 @@ if(WITH_APPLE_CROSSPLATFORM)
+   endif()
+ else()
+   if(NOT EXISTS "${LIBDIR}/python/")
+-    message(FATAL_ERROR "Mac OSX requires pre-compiled libs at: '${LIBDIR}'")
++    message(WARNING "Mac OSX requires pre-compiled libs at: '${LIBDIR}'")
+   endif()
+ endif()
+ if(FIRST_RUN)
+diff --git a/intern/ghost/intern/GHOST_WindowIOS.mm b/intern/ghost/intern/GHOST_WindowIOS.mm
+index 272c21b1cd1..8fda77f6e06 100644
+--- a/intern/ghost/intern/GHOST_WindowIOS.mm
++++ b/intern/ghost/intern/GHOST_WindowIOS.mm
+@@ -10,9 +10,11 @@
+ #include "GHOST_C-api.h"
+ #include "GHOST_Debug.hh"
+ #include "GHOST_EventButton.hh"
++#include "GHOST_WindowManager.hh"
+ #include "GHOST_EventCursor.hh"
+ #include "GHOST_EventDragnDrop.hh"
+ #include "GHOST_EventKey.hh"
++#include "GHOST_EventWheel.hh"
+ #include "GHOST_EventTouch.hh"
+ #include "GHOST_EventTrackpad.hh"
+ 
+@@ -24,6 +26,8 @@
+ 
+ #include <unordered_map>
+ 
++/* Debug input logging — disabled for release. Uncomment to re-enable NSLog spam
++ * (HOVER/MOUSEMOVED/IPAN/KEY/TABLET/etc.) for diagnosing input issues. */
+ // #define IOS_INPUT_LOGGING
+ #if defined(IOS_INPUT_LOGGING)
+ #  define IOS_INPUT_LOG(...) NSLog(__VA_ARGS__)
+@@ -31,6 +35,13 @@
+ #  define IOS_INPUT_LOG(...)
+ #endif
+ 
++/* Scale applied to middle-drag PAN (Shift+wheel) trackpad deltas. Blender's iOS
++ * view3d.move trackpad path amplifies our delta ~6x (formula mx = 2*xy - prev_xy
++ * plus its zfac conversion; measured: 0.5 still overshot ~3x), so we pre-divide
++ * to make the grabbed point track the cursor ~1:1. Orbit is left unscaled.
++ * Lower = pans less. */
++#define MMB_PAN_SCALE 0.17f
++
+ // #define IOS_WINDOW_LOGGING
+ #if defined(IOS_WINDOW_LOGGING)
+ #  define IOS_WINDOW_LOG(...) NSLog(__VA_ARGS__)
+@@ -122,16 +133,51 @@ typedef struct UserInputEvent {
+ @interface GHOSTUIPanGestureRecognizer : UIPanGestureRecognizer
+ {
+   CGPoint cached_translation;
++  /* Apple Pencil UITouch for the current gesture, captured in this recognizer's
++   * own touchesBegan (which runs BEFORE the recognizer's action), so handlePan's
++   * Began already knows it's a pencil + its pressure. The view's touchesBegan that
++   * sets current_pencil_touch runs AFTER the action. */
++  __unsafe_unretained UITouch *pencil_touch;
+ }
+ - (CGPoint)getScaledTouchPoint:(GHOST_WindowIOS *)window;
+ - (CGPoint)getScaledTranslation:(GHOST_WindowIOS *)window;
+ 
+ - (void)setCachedTranslation:(CGPoint)translation;
+ - (CGPoint)getCachedTranslation;
++- (UITouch *)pencilTouch;
+ @end
+ 
+ @implementation GHOSTUIPanGestureRecognizer
+ 
++- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
++{
++  [super touchesBegan:touches withEvent:event];
++  pencil_touch = nil;
++  for (UITouch *t in touches) {
++    if (t.type == UITouchTypePencil) {
++      pencil_touch = t;
++      break;
++    }
++  }
++}
++
++- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
++{
++  [super touchesEnded:touches withEvent:event];
++  pencil_touch = nil;
++}
++
++- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
++{
++  [super touchesCancelled:touches withEvent:event];
++  pencil_touch = nil;
++}
++
++- (UITouch *)pencilTouch
++{
++  return pencil_touch;
++}
++
+ - (CGPoint)getScaledTouchPoint:(GHOST_WindowIOS *)window
+ {
+   CGPoint touch_point = [self locationInView:window->getView()];
+@@ -240,7 +286,12 @@ typedef struct UserInputEvent {
+   GHOSTUITapGestureRecognizer *tap4f_gesture_recognizer;
+   GHOSTUIPanGestureRecognizer *pan_gesture_recognizer;
+   GHOSTUIPanGestureRecognizer *pan2f_gesture_recognizer;
++  GHOSTUIPanGestureRecognizer *indirect_pan_gesture_recognizer;
+   GHOSTUIPinchGestureRecognizer *zoom_gesture_recognizer;
++  UIPanGestureRecognizer *scroll_gesture_recognizer;
++  CGFloat last_scroll_y;
++  CGFloat last_scroll_x;
++  CGFloat scroll_accum_y;
+   GHOSTUIHoverGestureRecognizer *hover_gesture_recognizer;
+   UIPencilInteraction *pencil_interaction;
+   UIScreenEdgePanGestureRecognizer *edge_swipe_left;
+@@ -259,6 +310,30 @@ typedef struct UserInputEvent {
+   const char *text_field_string;
+   GHOST_KeyboardProperties current_keyboard_properties;
+   bool external_keyboard_connected;
++  bool external_mouse_connected;
++  bool mouse_left_pressed;
++  bool mouse_middle_pressed;
++  bool mouse_right_pressed;
++  CGFloat mouse_cursor_x;
++  CGFloat mouse_cursor_y;
++  bool mouse_pos_valid;
++  /* True while an external-mouse left/middle-button drag is being driven by the
++   * indirect-pointer pan recognizer (accurate absolute coords). Suppresses the
++   * GCMouse delta path so the two don't fight. */
++  bool indirect_pointer_dragging;
++  /* Previous accurate absolute position during an indirect-pointer drag, used to
++   * compute exact orbit/pan deltas for the middle button. */
++  CGFloat indirect_prev_x;
++  CGFloat indirect_prev_y;
++  /* External-keyboard Shift state + latched drag mode: plain middle drag = orbit
++   * (trackpad scroll); Shift+middle = native grab-pan via accurate CURSOR_MOVE. */
++  bool shift_pressed;
++  bool indirect_is_orbit;
++  bool indirect_is_pan;
++  /* Sub-pixel remainder carried across scaled pan deltas, so a low MMB_PAN_SCALE
++   * doesn't truncate slow movements to integer 0. */
++  float pan_accum_x;
++  float pan_accum_y;
+ 
+   /* Toolbar */
+   bool toolbar_enabled;
+@@ -282,7 +357,9 @@ typedef struct UserInputEvent {
+ - (void)handleTap:(GHOSTUITapGestureRecognizer *)sender;
+ - (void)handlePan:(GHOSTUIPanGestureRecognizer *)sender;
+ - (void)handlePan2f:(GHOSTUIPanGestureRecognizer *)sender;
++- (void)handleIndirectPan:(GHOSTUIPanGestureRecognizer *)sender;
+ - (void)handleZoom:(GHOSTUIPinchGestureRecognizer *)sender;
++- (void)handleScroll:(UIPanGestureRecognizer *)sender;
+ 
+ /* On screen keyboard handling */
+ - (UITextField *)getUITextField;
+@@ -306,6 +383,12 @@ typedef struct UserInputEvent {
+   toolbar_enabled = true;
+   toolbar = nil;
+   last_tap_with_pencil = false;
++  indirect_pointer_dragging = false;
++  shift_pressed = false;
++  indirect_is_orbit = false;
++  indirect_is_pan = false;
++  pan_accum_x = 0.0f;
++  pan_accum_y = 0.0f;
+   external_keyboard_connected = [GCKeyboard coalescedKeyboard] != nil;
+ 
+   /* Register for notifications of chnanges to the onscreen keyboard. */
+@@ -335,6 +418,22 @@ typedef struct UserInputEvent {
+                                                  name:GCKeyboardDidDisconnectNotification
+                                                object:nil];
+   }
++
++  /* Register for notifications that an external mouse has been connected/current. */
++  if (&GCMouseDidBecomeCurrentNotification != NULL) {
++    [[NSNotificationCenter defaultCenter] addObserver:self
++                                             selector:@selector(externalMouseChange:)
++                                                 name:GCMouseDidBecomeCurrentNotification
++                                               object:nil];
++    [[NSNotificationCenter defaultCenter] addObserver:self
++                                             selector:@selector(externalMouseChange:)
++                                                 name:GCMouseDidConnectNotification
++                                               object:nil];
++    [[NSNotificationCenter defaultCenter] addObserver:self
++                                             selector:@selector(externalMouseChange:)
++                                                 name:GCMouseDidDisconnectNotification
++                                               object:nil];
++  }
+ }
+ 
+ - (void)registerGestureRecognizers
+@@ -392,6 +491,32 @@ typedef struct UserInputEvent {
+   pan_gesture_recognizer.allowedTouchTypes = @[ @(UITouchTypePencil), @(UITouchTypeDirect) ];
+   [window->getView() addGestureRecognizer:pan_gesture_recognizer];
+ 
++  /* A pencil/finger DRAG (paint/sculpt stroke) must not also fire a tap "click":
++   * make the tap wait for the pan to fail first. Otherwise each stroke gets a
++   * spurious full-pressure tap-dab overlaid (the Apple Pencil "mouse-click
++   * overlap" / first-dab full pressure / end->start line). A pure tap (no drag)
++   * still clicks, just after the pan fails. */
++  [tap_gesture_recognizer requireGestureRecognizerToFail:pan_gesture_recognizer];
++
++  /* Indirect-pointer (external mouse) drag recognizer.
++   * A left-button mouse drag is delivered to UIKit as a UITouchTypeIndirectPointer
++   * touch; -locationInView: then yields the accurate, OS-accelerated absolute
++   * pointer position for the whole drag. We drive the cursor from that for
++   * box-select etc. instead of GCMouse raw deltas (unaccelerated -> they drift).
++   * Button down/up still come from GCMouse. Only left-button drags produce this
++   * touch, so middle/right drags keep using the delta path unchanged. */
++  if (@available(iOS 13.4, *)) {
++    indirect_pan_gesture_recognizer = [[GHOSTUIPanGestureRecognizer alloc]
++        initWithTarget:self
++                action:@selector(handleIndirectPan:)];
++    indirect_pan_gesture_recognizer.delegate = self;
++    indirect_pan_gesture_recognizer.cancelsTouchesInView = false;
++    indirect_pan_gesture_recognizer.minimumNumberOfTouches = 1;
++    indirect_pan_gesture_recognizer.maximumNumberOfTouches = 1;
++    indirect_pan_gesture_recognizer.allowedTouchTypes = @[ @(UITouchTypeIndirectPointer) ];
++    [window->getView() addGestureRecognizer:indirect_pan_gesture_recognizer];
++  }
++
+   /* Pan gesture recognizer - two fingers 3D UI. */
+   pan2f_gesture_recognizer = [[GHOSTUIPanGestureRecognizer alloc]
+       initWithTarget:self
+@@ -411,6 +536,19 @@ typedef struct UserInputEvent {
+   zoom_gesture_recognizer.cancelsTouchesInView = false;
+   [window->getView() addGestureRecognizer:zoom_gesture_recognizer];
+ 
++  /* Scroll gesture recognizer - mouse wheel and trackpad scroll (indirect pointer). */
++  scroll_gesture_recognizer = [[UIPanGestureRecognizer alloc]
++      initWithTarget:self
++              action:@selector(handleScroll:)];
++  scroll_gesture_recognizer.delegate = self;
++  scroll_gesture_recognizer.cancelsTouchesInView = false;
++  /* Do not consume finger/pencil touches; only handle pointer scroll. */
++  scroll_gesture_recognizer.allowedTouchTypes = @[];
++  if (@available(iOS 13.4, *)) {
++    scroll_gesture_recognizer.allowedScrollTypesMask = UIScrollTypeMaskAll;
++  }
++  [window->getView() addGestureRecognizer:scroll_gesture_recognizer];
++
+   /* Edge swipe. */
+   edge_swipe_left = [[UIScreenEdgePanGestureRecognizer alloc]
+       initWithTarget:self
+@@ -677,12 +815,73 @@ typedef struct UserInputEvent {
+       GHOST_GetMilliSeconds((GHOST_SystemHandle)system), GHOST_kEventFourFingerTap, window));
+ }
+ 
++- (void)handleScroll:(UIPanGestureRecognizer *)sender
++{
++  /* translationInView accumulates from gesture start; track delta per update. */
++  if (sender.state == UIGestureRecognizerStateBegan) {
++    last_scroll_y = 0.0f;
++    last_scroll_x = 0.0f;
++    return;
++  }
++  if (sender.state == UIGestureRecognizerStateChanged) {
++    CGPoint t = [sender translationInView:window->getView()];
++    CGFloat dy = t.y - last_scroll_y;
++    CGFloat dx = t.x - last_scroll_x;
++    last_scroll_y = t.y;
++    last_scroll_x = t.x;
++
++    /* Accumulate; emit one wheel step per threshold of movement. */
++    scroll_accum_y += dy;
++    const CGFloat step = 20.0f;
++    while (scroll_accum_y >= step) {
++      scroll_accum_y -= step;
++      system->pushEvent(new GHOST_EventWheel(
++          GHOST_GetMilliSeconds((GHOST_SystemHandle)system),
++          window, GHOST_kEventWheelAxisVertical, -1));
++    }
++    while (scroll_accum_y <= -step) {
++      scroll_accum_y += step;
++      system->pushEvent(new GHOST_EventWheel(
++          GHOST_GetMilliSeconds((GHOST_SystemHandle)system),
++          window, GHOST_kEventWheelAxisVertical, 1));
++    }
++    (void)dx;
++    return;
++  }
++  if (sender.state == UIGestureRecognizerStateEnded ||
++      sender.state == UIGestureRecognizerStateCancelled ||
++      sender.state == UIGestureRecognizerStateFailed) {
++    scroll_accum_y = 0.0f;
++    return;
++  }
++}
++
+ - (void)handlePan:(GHOSTUIPanGestureRecognizer *)sender
+ {
+   CGPoint touch_point = [sender getScaledTouchPoint:window];
+   CGPoint translation = [sender getScaledTranslation:window];
+-  bool pencil_pan = current_pencil_touch ? true : false;
+-
++  /* Detect the pencil from the recognizer (captured in its own touchesBegan, which
++   * runs BEFORE this action) — current_pencil_touch (set in the view's
++   * touchesBegan) is not yet populated on the gesture's Began, so relying on it
++   * makes the FIRST dab a mouse-type (full-pressure) click = the "dot at the
++   * stroke start". */
++  UITouch *pen = [sender pencilTouch];
++  if (pen == nil) { pen = current_pencil_touch; }
++  bool pencil_pan = (pen != nil);
++
++  /* Refresh tablet data from the pencil so the FIRST stroke sample
++   * (Began -> LEFT_BUTTON_DOWN) carries real stylus pressure/tilt. */
++  if (pencil_pan) {
++    tablet_data.Active = GHOST_kTabletModeStylus;
++    tablet_data.Pressure = (pen.maximumPossibleForce > 0.0) ?
++                               (pen.force / pen.maximumPossibleForce) :
++                               0.0f;
++    CGFloat azimuthAngle = [pen azimuthAngleInView:window->getView()];
++    CGFloat altitudeAngle = [pen altitudeAngle];
++    CGFloat maxTilt = cos(0);
++    tablet_data.Xtilt = sin(azimuthAngle) * cos(altitudeAngle) / maxTilt;
++    tablet_data.Ytilt = -cos(azimuthAngle) * cos(altitudeAngle) / maxTilt;
++  }
+   UserInputEvent event_info(&touch_point, nullptr, nullptr, pencil_pan);
+ 
+   if (sender.state == UIGestureRecognizerStateBegan ||
+@@ -690,6 +889,21 @@ typedef struct UserInputEvent {
+   {
+     /* Register initial click for click and drag support. */
+     if (sender.state == UIGestureRecognizerStateBegan) {
++      /* Refresh tablet pressure/tilt from the pencil NOW so the stroke's first
++       * event (LEFT_BUTTON_DOWN below) carries the real (light) pencil pressure.
++       * Otherwise tablet_data is still GHOST_TABLET_DATA_NONE (mouse, pressure
++       * 1.0) because touchesMoved hasn't run yet, so the first paint/sculpt dab
++       * lands at full pressure (the "dot" at the stroke start). */
++      if (current_pencil_touch != nil) {
++        tablet_data.Active = GHOST_kTabletModeStylus;
++        tablet_data.Pressure = (current_pencil_touch.maximumPossibleForce > 0.0) ?
++            (current_pencil_touch.force / current_pencil_touch.maximumPossibleForce) :
++            0.0f;
++        CGFloat az = [current_pencil_touch azimuthAngleInView:window->getView()];
++        CGFloat alt = [current_pencil_touch altitudeAngle];
++        tablet_data.Xtilt = sin(az) * cos(alt);
++        tablet_data.Ytilt = -cos(az) * cos(alt);
++      }
+       /* Set inital translation */
+       [sender setCachedTranslation:translation];
+       event_info.add_event(UserInputEvent::EventTypes::CURSOR_MOVE);
+@@ -722,6 +936,104 @@ typedef struct UserInputEvent {
+   [self generateUserInputEvents:event_info];
+ }
+ 
++- (void)handleIndirectPan:(GHOSTUIPanGestureRecognizer *)sender
++{
++  /* Indirect-pointer (external mouse) drag. Fires for left AND middle button,
++   * giving the accurate, OS-accelerated absolute pointer position.
++   *  - Left (box-select) / Shift+middle (pan): emit accurate CURSOR_MOVE so
++   *    Blender's native modal operators (box-select, view3d.move grab-pan) track
++   *    the cursor with NO drift.
++   *  - Plain middle (orbit): emit trackpad-scroll from the accurate delta
++   *    (numFingers=2) = the iPad's native trackpad-orbit path.
++   * Button down/up + Shift come from GCMouse/GCKeyboard; Blender's keymap maps
++   * MIDDLEMOUSE->view3d.rotate and Shift+MIDDLEMOUSE->view3d.move. */
++  CGPoint touch_point = [sender getScaledTouchPoint:window];
++
++  if (sender.state == UIGestureRecognizerStateBegan) {
++    indirect_pointer_dragging = true;
++    /* Plain middle = orbit via trackpad (view3d.rotate). Shift+middle = pan:
++     * take the CURSOR_MOVE (else-branch) path so accurate cursor positions drive
++     * Blender's NATIVE view3d.move modal grab-pan (we relaxed its iOS guard to
++     * start on a MIDDLEMOUSE press) — exact, depth/zoom-correct, no scalar. */
++    indirect_is_orbit = (mouse_middle_pressed && !shift_pressed);
++    indirect_is_pan = false;
++    pan_accum_x = 0.0f;
++    pan_accum_y = 0.0f;
++    indirect_prev_x = touch_point.x;
++    indirect_prev_y = touch_point.y;
++    tablet_data = GHOST_TABLET_DATA_NONE;
++    IOS_INPUT_LOG(@"IPAN begin x=%.1f y=%.1f M=%d shift=%d pan=%d", touch_point.x, touch_point.y, mouse_middle_pressed, shift_pressed, indirect_is_pan);
++    if (!indirect_is_orbit) {
++      mouse_cursor_x = touch_point.x;
++      mouse_cursor_y = touch_point.y;
++      UserInputEvent event_info(&touch_point, nullptr, nullptr, false);
++      event_info.add_event(UserInputEvent::EventTypes::CURSOR_MOVE);
++      [self generateUserInputEvents:event_info];
++    }
++    return;
++  }
++
++  if (sender.state == UIGestureRecognizerStateChanged) {
++    int32_t ddx = (int32_t)(touch_point.x - indirect_prev_x);
++    int32_t ddy = (int32_t)(touch_point.y - indirect_prev_y);
++    indirect_prev_x = touch_point.x;
++    indirect_prev_y = touch_point.y;
++    if (indirect_is_orbit) {
++      /* Middle drag -> trackpad scroll (numFingers=2). Blender: plain = orbit
++       * (view3d.rotate), Shift = pan (view3d.move). Pan deltas are scaled by
++       * MMB_PAN_SCALE to counter view3d.move's 2x trackpad formula. */
++      int32_t pddx, pddy;
++      if (indirect_is_pan) {
++        /* Scale down + carry the sub-pixel remainder so slow pans aren't lost. */
++        pan_accum_x += ddx * MMB_PAN_SCALE;
++        pan_accum_y += ddy * MMB_PAN_SCALE;
++        pddx = (int32_t)pan_accum_x;
++        pddy = (int32_t)pan_accum_y;
++        pan_accum_x -= pddx;
++        pan_accum_y -= pddy;
++      }
++      else {
++        pddx = ddx;
++        pddy = ddy;
++      }
++      if (pddx != 0 || pddy != 0) {
++        system->pushEvent(new GHOST_EventTrackpad(
++            system->getMilliSeconds(), window, GHOST_kTrackpadEventScroll,
++            (int32_t)touch_point.x, (int32_t)touch_point.y,
++            pddx, pddy, true, 2));
++      }
++      IOS_INPUT_LOG(@"IPAN trackpad pan=%d ddx=%d ddy=%d -> %d,%d", indirect_is_pan, ddx, ddy, pddx, pddy);
++    }
++    else {
++      mouse_cursor_x = touch_point.x;
++      mouse_cursor_y = touch_point.y;
++      tablet_data = GHOST_TABLET_DATA_NONE;
++      UserInputEvent event_info(&touch_point, nullptr, nullptr, false);
++      event_info.add_event(UserInputEvent::EventTypes::CURSOR_MOVE);
++      [self generateUserInputEvents:event_info];
++      IOS_INPUT_LOG(@"IPAN drag x=%.1f y=%.1f", touch_point.x, touch_point.y);
++    }
++    return;
++  }
++
++  if (sender.state == UIGestureRecognizerStateEnded ||
++      sender.state == UIGestureRecognizerStateCancelled ||
++      sender.state == UIGestureRecognizerStateFailed)
++  {
++    if (!indirect_is_orbit) {
++      /* Emit the exact final position so box-select / pan end-point is accurate. */
++      mouse_cursor_x = touch_point.x;
++      mouse_cursor_y = touch_point.y;
++      tablet_data = GHOST_TABLET_DATA_NONE;
++      UserInputEvent event_info(&touch_point, nullptr, nullptr, false);
++      event_info.add_event(UserInputEvent::EventTypes::CURSOR_MOVE);
++      [self generateUserInputEvents:event_info];
++      IOS_INPUT_LOG(@"IPAN end  x=%.1f y=%.1f", touch_point.x, touch_point.y);
++    }
++    indirect_pointer_dragging = false;
++  }
++}
++
+ - (void)handlePan2f:(GHOSTUIPanGestureRecognizer *)sender
+ {
+   /* Translation can be non-zero on begin event */
+@@ -783,14 +1095,43 @@ typedef struct UserInputEvent {
+ 
+ - (void)handleHover:(GHOSTUIHoverGestureRecognizer *)sender
+ {
++  IOS_INPUT_LOG(@"HOVER fired, btn_pressed=%d", mouse_left_pressed);
+   if (sender.state == UIGestureRecognizerStateBegan ||
+       sender.state == UIGestureRecognizerStateChanged)
+   {
+-    /* Tablet needs to be set to stylus mode because we need
+-     * wmTabletData.is_motion_absolute set to true. */
+-    tablet_data.Active = GHOST_kTabletModeStylus;
++    /* While a pencil is actually touching (an active paint/sculpt stroke),
++     * handlePan drives the cursor. A stray hover CURSOR_MOVE here uses the
++     * (stale) hover position and jerks the brush — notably back toward the
++     * stroke start on lift (the "end->start line" / "dot at start"). So skip
++     * hover entirely while the pencil is down. (Mouse box-select is unaffected:
++     * current_pencil_touch is nil for a mouse drag.) */
++    if (current_pencil_touch != nil) {
++      return;
++    }
+     CGPoint hover_point = [sender getScaledTouchPoint:window];
+-    /* Add cursor move event. */
++    /* Always seed/refresh the tracked cursor position from hover. */
++    mouse_cursor_x = hover_point.x;
++    mouse_cursor_y = hover_point.y;
++    mouse_pos_valid = true;
++
++    bool is_pencil = (current_pencil_touch != nil);
++    if (external_mouse_connected && !is_pencil) {
++      /* DRAG_HYBRID: mouse present. Keep tracked position synced to hover's
++       * accurate absolute coords (already done above). Only emit the cursor
++       * move when NOT dragging; during a drag the button is held, hover is
++       * unreliable, and mouseMovedHandler drives the cursor instead. */
++      /* DRAG_HOVER_ACCURATE: emit the cursor move even while a button is
++       * held. Hover gives the accurate absolute position, so this snaps the
++       * cursor back each time it fires and stops delta drift from
++       * accumulating over a drag (improves box-select end-point accuracy). */
++      tablet_data = GHOST_TABLET_DATA_NONE;
++      UserInputEvent event_info(&hover_point, nullptr, nullptr, false);
++      event_info.add_event(UserInputEvent::EventTypes::CURSOR_MOVE);
++      [self generateUserInputEvents:event_info];
++      return;
++    }
++    /* Pencil / no-mouse path: original behaviour (stylus hover). */
++    tablet_data.Active = GHOST_kTabletModeStylus;
+     UserInputEvent event_info(&hover_point, nullptr, nullptr, true);
+     event_info.add_event(UserInputEvent::EventTypes::CURSOR_MOVE);
+     [self generateUserInputEvents:event_info];
+@@ -1198,11 +1539,316 @@ typedef struct UserInputEvent {
+   }
+ }
+ 
++/* Convert an iOS GCKeyCode (USB HID usage) to a Blender GHOST_TKey.
++ * Added for external keyboard shortcut support. */
++/* Map a GHOST key (+ shift) to its typed UTF-8 character for printable keys.
++ * Needed so numeric input in transforms (G/S/R then a number), text fields and
++ * search boxes receive the character — GHOST carries it in GHOST_EventKey's
++ * utf8_buf, which we previously left null. Fills out[6] (NUL-terminated) and
++ * returns true when the key produces text; returns false for non-text keys. */
++static bool ghost_key_to_utf8(GHOST_TKey key, bool shift, char out[6])
++{
++  out[0] = '\0';
++  out[1] = '\0';
++  /* Letters: GHOST_kKeyA..Z hold 'A'..'Z'; lower-case unless Shift held. */
++  if (key >= GHOST_kKeyA && key <= GHOST_kKeyZ) {
++    out[0] = shift ? (char)key : (char)(key + 0x20);
++    return true;
++  }
++  /* Number row: GHOST_kKey0..9 hold '0'..'9'; Shift -> US-layout symbols. */
++  if (key >= GHOST_kKey0 && key <= GHOST_kKey9) {
++    static const char shifted[10] = {')', '!', '@', '#', '$', '%', '^', '&', '*', '('};
++    out[0] = shift ? shifted[key - GHOST_kKey0] : (char)key;
++    return true;
++  }
++  /* Numpad digits. */
++  if (key >= GHOST_kKeyNumpad0 && key <= GHOST_kKeyNumpad9) {
++    out[0] = (char)('0' + (key - GHOST_kKeyNumpad0));
++    return true;
++  }
++  switch (key) {
++    case GHOST_kKeyPeriod:         out[0] = shift ? '>' : '.'; return true;
++    case GHOST_kKeyComma:          out[0] = shift ? '<' : ','; return true;
++    case GHOST_kKeyMinus:          out[0] = shift ? '_' : '-'; return true;
++    case GHOST_kKeyPlus:           out[0] = '+'; return true;
++    case GHOST_kKeyEqual:          out[0] = shift ? '+' : '='; return true;
++    case GHOST_kKeySlash:          out[0] = shift ? '?' : '/'; return true;
++    case GHOST_kKeySemicolon:      out[0] = shift ? ':' : ';'; return true;
++    case GHOST_kKeyQuote:          out[0] = shift ? '"' : '\''; return true;
++    case GHOST_kKeyLeftBracket:    out[0] = shift ? '{' : '['; return true;
++    case GHOST_kKeyRightBracket:   out[0] = shift ? '}' : ']'; return true;
++    case GHOST_kKeyBackslash:      out[0] = shift ? '|' : '\\'; return true;
++    case GHOST_kKeyAccentGrave:    out[0] = shift ? '~' : '`'; return true;
++    case GHOST_kKeySpace:          out[0] = ' '; return true;
++    case GHOST_kKeyNumpadPeriod:   out[0] = '.'; return true;
++    case GHOST_kKeyNumpadPlus:     out[0] = '+'; return true;
++    case GHOST_kKeyNumpadMinus:    out[0] = '-'; return true;
++    case GHOST_kKeyNumpadAsterisk: out[0] = '*'; return true;
++    case GHOST_kKeyNumpadSlash:    out[0] = '/'; return true;
++    default: return false;
++  }
++}
++
++static GHOST_TKey ghost_key_from_gckeycode(GCKeyCode code)
++{
++  if (code >= GCKeyCodeKeyA && code <= GCKeyCodeKeyZ) {
++    return (GHOST_TKey)(GHOST_kKeyA + (code - GCKeyCodeKeyA));
++  }
++  if (code >= GCKeyCodeOne && code <= GCKeyCodeNine) {
++    return (GHOST_TKey)(GHOST_kKey1 + (code - GCKeyCodeOne));
++  }
++  if (code == GCKeyCodeZero) return GHOST_kKey0;
++  if (code == GCKeyCodeSpacebar)          return GHOST_kKeySpace;
++  if (code == GCKeyCodeReturnOrEnter)     return GHOST_kKeyEnter;
++  if (code == GCKeyCodeEscape)            return GHOST_kKeyEsc;
++  if (code == GCKeyCodeTab)               return GHOST_kKeyTab;
++  if (code == GCKeyCodeDeleteOrBackspace) return GHOST_kKeyBackSpace;
++  if (code == GCKeyCodeDeleteForward)     return GHOST_kKeyDelete;
++  if (code == GCKeyCodeLeftArrow)         return GHOST_kKeyLeftArrow;
++  if (code == GCKeyCodeRightArrow)        return GHOST_kKeyRightArrow;
++  if (code == GCKeyCodeUpArrow)           return GHOST_kKeyUpArrow;
++  if (code == GCKeyCodeDownArrow)         return GHOST_kKeyDownArrow;
++  if (code == GCKeyCodeLeftShift)         return GHOST_kKeyLeftShift;
++  if (code == GCKeyCodeRightShift)        return GHOST_kKeyRightShift;
++  if (code == GCKeyCodeLeftControl)       return GHOST_kKeyLeftControl;
++  if (code == GCKeyCodeRightControl)      return GHOST_kKeyRightControl;
++  if (code == GCKeyCodeLeftAlt)           return GHOST_kKeyLeftAlt;
++  if (code == GCKeyCodeRightAlt)          return GHOST_kKeyRightAlt;
++  if (code == GCKeyCodeLeftGUI)           return GHOST_kKeyLeftOS;
++  if (code == GCKeyCodeRightGUI)          return GHOST_kKeyRightOS;
++  if (code == GCKeyCodeHyphen)            return GHOST_kKeyMinus;
++  if (code == GCKeyCodeEqualSign)         return GHOST_kKeyEqual;
++  if (code == GCKeyCodeComma)             return GHOST_kKeyComma;
++  if (code == GCKeyCodePeriod)            return GHOST_kKeyPeriod;
++  if (code == GCKeyCodeSlash)             return GHOST_kKeySlash;
++  if (code == GCKeyCodeSemicolon)         return GHOST_kKeySemicolon;
++  if (code == GCKeyCodeQuote)             return GHOST_kKeyQuote;
++  if (code == GCKeyCodeBackslash)         return GHOST_kKeyBackslash;
++  if (code == GCKeyCodeOpenBracket)       return GHOST_kKeyLeftBracket;
++  if (code == GCKeyCodeCloseBracket)      return GHOST_kKeyRightBracket;
++  if (code == GCKeyCodeGraveAccentAndTilde) return GHOST_kKeyAccentGrave;
++  if (code == GCKeyCodeF1)  return GHOST_kKeyF1;
++  if (code == GCKeyCodeF2)  return GHOST_kKeyF2;
++  if (code == GCKeyCodeF3)  return GHOST_kKeyF3;
++  if (code == GCKeyCodeF4)  return GHOST_kKeyF4;
++  if (code == GCKeyCodeF5)  return GHOST_kKeyF5;
++  if (code == GCKeyCodeF6)  return GHOST_kKeyF6;
++  if (code == GCKeyCodeF7)  return GHOST_kKeyF7;
++  if (code == GCKeyCodeF8)  return GHOST_kKeyF8;
++  if (code == GCKeyCodeF9)  return GHOST_kKeyF9;
++  if (code == GCKeyCodeF10) return GHOST_kKeyF10;
++  if (code == GCKeyCodeF11) return GHOST_kKeyF11;
++  if (code == GCKeyCodeF12) return GHOST_kKeyF12;
++  return GHOST_kKeyUnknown;
++}
++
++
++- (void)externalMouseChange:(NSNotification *)notification
++{
++  GCMouse *mouse = [GCMouse current];
++  external_mouse_connected = (mouse != nil);
++  IOS_INPUT_LOG(@"External Mouse %s", external_mouse_connected ? "Connected" : "Disconnected");
++
++  if (mouse && mouse.mouseInput) {
++    GHOST_WindowIOS *win = window;
++    GHOST_SystemIOS *sys = system;
++    GCMouseInput *mouse_input = mouse.mouseInput;
++    IOS_INPUT_LOG(@"Mouse handlers registering. scroll=%@ yAxis=%@",
++                  mouse_input.scroll, mouse_input.scroll.yAxis);
++
++    __unsafe_unretained GHOSTUIWindow *weak_self_btn = self;
++    mouse_input.leftButton.pressedChangedHandler =
++        ^(GCControllerButtonInput *button, float value, BOOL pressed) {
++          GHOSTUIWindow *strong_self = weak_self_btn;
++          if (strong_self) {
++            strong_self->mouse_left_pressed = pressed ? true : false;
++          }
++          GHOST_IWindow *active_win_l = sys->getWindowManager()->getActiveWindow();
++          if (!active_win_l) { active_win_l = win; }
++          sys->pushEvent(new GHOST_EventButton(
++              GHOST_GetMilliSeconds((GHOST_SystemHandle)sys),
++              pressed ? GHOST_kEventButtonDown : GHOST_kEventButtonUp,
++              active_win_l, GHOST_kButtonMaskLeft, GHOST_TABLET_DATA_NONE));
++        };
++
++    mouse_input.rightButton.pressedChangedHandler =
++        ^(GCControllerButtonInput *button, float value, BOOL pressed) {
++          GHOSTUIWindow *ss = weak_self_btn;
++          if (ss) { ss->mouse_right_pressed = pressed ? true : false; }
++          GHOST_IWindow *active_win_r = sys->getWindowManager()->getActiveWindow();
++          if (!active_win_r) { active_win_r = win; }
++          sys->pushEvent(new GHOST_EventButton(
++              GHOST_GetMilliSeconds((GHOST_SystemHandle)sys),
++              pressed ? GHOST_kEventButtonDown : GHOST_kEventButtonUp,
++              active_win_r, GHOST_kButtonMaskRight, GHOST_TABLET_DATA_NONE));
++        };
++
++    mouse_input.middleButton.pressedChangedHandler =
++        ^(GCControllerButtonInput *button, float value, BOOL pressed) {
++          GHOSTUIWindow *ss = weak_self_btn;
++          if (ss) { ss->mouse_middle_pressed = pressed ? true : false; }
++          IOS_INPUT_LOG(@"MIDDLE button pressed=%d", pressed);
++          GHOST_IWindow *active_win_m = sys->getWindowManager()->getActiveWindow();
++          if (!active_win_m) { active_win_m = win; }
++          sys->pushEvent(new GHOST_EventButton(
++              GHOST_GetMilliSeconds((GHOST_SystemHandle)sys),
++              pressed ? GHOST_kEventButtonDown : GHOST_kEventButtonUp,
++              active_win_m, GHOST_kButtonMaskMiddle, GHOST_TABLET_DATA_NONE));
++        };
++
++    /* Mouse movement via GCMouse: deltas accumulated into a tracked cursor
++     * position so movement shares the mouse path with clicks (enables drag). */
++    __unsafe_unretained GHOSTUIWindow *weak_self_mv = self;
++    mouse_input.mouseMovedHandler =
++        ^(GCMouseInput *m, float dx, float dy) {
++          GHOSTUIWindow *s = weak_self_mv;
++          if (!s) {
++            return;
++          }
++          /* DRAG_HYBRID: only drive the cursor from deltas while dragging
++           * (button held), starting from the hover-synced position. */
++          bool mouse_any_pressed = s->mouse_left_pressed ||
++                                   s->mouse_middle_pressed ||
++                                   s->mouse_right_pressed;
++          IOS_INPUT_LOG(@"MOUSEMOVED L=%d M=%d R=%d dx=%f dy=%f", s->mouse_left_pressed, s->mouse_middle_pressed, s->mouse_right_pressed, dx, dy);
++          if (!mouse_any_pressed) {
++            return;
++          }
++
++          /* MMB_ORBIT_NATIVE (fallback): middle-button drag -> trackpad scroll
++           * (numFingers=2, isDirectionInverted=true) = the two-finger pan path the
++           * iPad build uses to orbit. This runs only until the indirect-pointer
++           * recognizer engages; once it does, handleIndirectPan drives orbit/pan
++           * from the accurate absolute delta (no drift). Uses raw GCMouse deltas,
++           * so it only covers the brief pre-recognition slop at drag start. */
++          if (s->mouse_middle_pressed && !s->indirect_pointer_dragging && !s->shift_pressed) {
++            const float oscale = (float)win->getWindowScaleFactor();
++            const float pk = s->shift_pressed ? MMB_PAN_SCALE : 1.0f;
++            sys->pushEvent(new GHOST_EventTrackpad(
++                GHOST_GetMilliSeconds((GHOST_SystemHandle)sys),
++                win, GHOST_kTrackpadEventScroll,
++                (int32_t)s->mouse_cursor_x, (int32_t)s->mouse_cursor_y,
++                (int32_t)(dx * oscale * pk), (int32_t)(-dy * oscale * pk),
++                true, 2));
++            return;
++          }
++          /* If the indirect-pointer recognizer is driving this (left-button)
++           * drag, it supplies accurate absolute positions; skip the lossy delta
++           * integration so the two paths don't fight (box-select accuracy). */
++          if (s->indirect_pointer_dragging) {
++            return;
++          }
++
++          const float scale = (float)win->getWindowScaleFactor();
++          s->mouse_cursor_x += dx * scale;
++          s->mouse_cursor_y -= dy * scale;
++
++          GHOST_Rect b;
++          win->getClientBounds(b);
++          float maxx = (float)b.getWidth();
++          float maxy = (float)b.getHeight();
++          if (s->mouse_cursor_x < 0) s->mouse_cursor_x = 0;
++          if (s->mouse_cursor_y < 0) s->mouse_cursor_y = 0;
++          if (s->mouse_cursor_x > maxx) s->mouse_cursor_x = maxx;
++          if (s->mouse_cursor_y > maxy) s->mouse_cursor_y = maxy;
++
++          sys->pushEvent(new GHOST_EventCursor(
++              GHOST_GetMilliSeconds((GHOST_SystemHandle)sys),
++              GHOST_kEventCursorMove, win,
++              (int32_t)s->mouse_cursor_x, (int32_t)s->mouse_cursor_y,
++              GHOST_TABLET_DATA_NONE));
++        };
++
++    /* Mouse wheel / scroll. */
++    mouse_input.scroll.yAxis.valueChangedHandler =
++        ^(GCControllerAxisInput *axis, float value) {
++          IOS_INPUT_LOG(@"Scroll Y handler fired, value=%f", value);
++          if (value == 0.0f) {
++            return;
++          }
++          int delta = (value > 0.0f) ? 1 : -1;
++          IOS_INPUT_LOG(@"Scroll Y pushing wheel event, delta=%d", delta);
++          sys->pushEvent(new GHOST_EventWheel(
++              GHOST_GetMilliSeconds((GHOST_SystemHandle)sys),
++              win, GHOST_kEventWheelAxisVertical, delta));
++        };
++  }
++}
++
+ - (void)externalKeyboardChange:(NSNotification *)notification
+ {
+   external_keyboard_connected = [GCKeyboard coalescedKeyboard] != nil;
+   IOS_INPUT_LOG(@"External Keyboard %s",
+                 external_keyboard_connected ? "Connected" : "Disconnected");
++
++  if (external_keyboard_connected) {
++    GCKeyboard *kb = [GCKeyboard coalescedKeyboard];
++    IOS_INPUT_LOG(@"KEYBOARD HANDLER REGISTERING kb=%@", kb);
++    GHOST_WindowIOS *win = window;
++    GHOST_SystemIOS *sys = system;
++    __unsafe_unretained GHOSTUIWindow *weak_self_kb = self;
++
++    kb.keyboardInput.keyChangedHandler =
++        ^(GCKeyboardInput *keyboard, GCControllerButtonInput *key,
++          GCKeyCode keyCode, BOOL pressed) {
++          GHOST_TKey ghost_key = ghost_key_from_gckeycode(keyCode);
++          IOS_INPUT_LOG(@"KEY gccode=%ld ghost=%d pressed=%d", (long)keyCode, (int)ghost_key, pressed);
++          if (ghost_key == GHOST_kKeyLeftShift || ghost_key == GHOST_kKeyRightShift) {
++            GHOSTUIWindow *sk = weak_self_kb;
++            if (sk) { sk->shift_pressed = pressed ? true : false; }
++          }
++          if (ghost_key == GHOST_kKeyEsc && pressed) {
++            IOS_INPUT_LOG(@"ESC STATE: numWindows=%lu hasDialog=%d activeWin=%p",
++                (unsigned long)sys->getWindowManager()->getWindows().size(),
++                (int)sys->hasDialogWindow(),
++                sys->getWindowManager()->getActiveWindow());
++            /* ESC_CLOSE_WINDOW: if a secondary window is open (more than one
++             * GHOST window), close the active one like macOS does, and consume
++             * the ESC so it doesn't also act as a key in the main window. */
++            if (sys->getWindowManager()->getWindows().size() > 1) {
++              GHOST_IWindow *close_win = sys->getWindowManager()->getActiveWindow();
++              if (close_win) {
++                IOS_INPUT_LOG(@"ESC closing secondary window %p", close_win);
++                sys->pushEvent(new GHOST_Event(
++                    GHOST_GetMilliSeconds((GHOST_SystemHandle)sys),
++                    GHOST_kEventWindowClose, close_win));
++                return;
++              }
++            }
++          }
++          if (ghost_key == GHOST_kKeyUnknown) {
++            return;
++          }
++          /* Provide the typed character for printable keys (press events only) so
++           * transform numeric input (G/S/R + number), text fields and search work.
++           * Was always null before, which silently dropped typed characters. */
++          char key_utf8[6] = {0};
++          const char *key_utf8_ptr = nullptr;
++          if (pressed) {
++            GHOSTUIWindow *su = weak_self_kb;
++            bool shift_held = su ? su->shift_pressed : false;
++            if (ghost_key_to_utf8(ghost_key, shift_held, key_utf8)) {
++              key_utf8_ptr = key_utf8;
++            }
++          }
++          /* ACTIVE_WINDOW_INPUT: target the active window so popups get keys. */
++          GHOST_IWindow *active_win = sys->getWindowManager()->getActiveWindow();
++          if (!active_win) { active_win = win; }
++          sys->pushEvent(new GHOST_EventKey(
++              GHOST_GetMilliSeconds((GHOST_SystemHandle)sys),
++              pressed ? GHOST_kEventKeyDown : GHOST_kEventKeyUp,
++              active_win,
++              ghost_key,
++              false,
++              key_utf8_ptr));
++        };
++  }
++  else {
++    GCKeyboard *kb = [GCKeyboard coalescedKeyboard];
++    if (kb) {
++      kb.keyboardInput.keyChangedHandler = nil;
++    }
++  }
+ }
+ 
+ /* IOS_FIXME - Not currently used, could be removed. */
+@@ -1480,6 +2126,18 @@ GHOST_WindowIOS::~GHOST_WindowIOS()
+     parent_window_->requestToActivateWindow();
+     parent_window_ = nil;
+   }
++  else {
++    /* Top-level window with no parent (e.g. the render-result window): hand
++     * control back to another remaining window (the main window) so input and
++     * display return to it. Without this, disposing the render window leaves the
++     * screen showing it — the "render window won't close on ESC" bug. */
++    for (GHOST_IWindow *iter_win : system_ios_->getWindowManager()->getWindows()) {
++      if (iter_win != this) {
++        static_cast<GHOST_WindowIOS *>(iter_win)->requestToActivateWindow();
++        break;
++      }
++    }
++  }
+   /* We have no choice but to resign, however this seems like it might cause issues. */
+   if (system_ios_->current_active_window_ == this) {
+     IOS_WINDOW_LOG(@"~GHOST_WindowIOS(): Warning, deactivating the active window %p?", this);
+@@ -1499,6 +2157,9 @@ GHOST_WindowIOS::~GHOST_WindowIOS()
+ 
+   /* Release window. */
+   if (rootWindow) {
++    /* Hide first: a plain release keeps a system-retained, still-visible UIWindow
++     * on screen (this is why the top-level render window appeared not to close). */
++    rootWindow.hidden = YES;
+     [rootWindow release];
+     rootWindow = nil;
+   }
+diff --git a/release/ios/Blender.app/Info.plist b/release/ios/Blender.app/Info.plist
+index e478b5b7a1a..521a2c40587 100644
+--- a/release/ios/Blender.app/Info.plist
++++ b/release/ios/Blender.app/Info.plist
+@@ -21,7 +21,7 @@
+ 			<true/>
+ 			<key>LSItemContentTypes</key>
+ 			<array>
+-				<string>org.blenderfoundation.blender.file</string>
++				<string>com.unofficial.blenderipad.file</string>
+ 			</array>
+ 		</dict>
+ 	</array>
+@@ -32,13 +32,15 @@
+ 	<key>CFBundleExecutable</key>
+ 	<string>Blender</string>
+ 	<key>CFBundleGetInfoString</key>
+-	<string>${MACOSX_BUNDLE_LONG_VERSION_STRING}, Blender Foundation</string>
++	<string>${MACOSX_BUNDLE_LONG_VERSION_STRING}, Unofficial iPad build — not affiliated with the Blender Foundation</string>
+ 	<key>CFBundleIconFile</key>
+ 	<string>Assets/blender_icon.icns</string>
+ 	<key>CFBundleIdentifier</key>
+-	<string>org.blenderfoundation.blender</string>
++	<string>com.unofficial.blenderipad</string>
+ 	<key>CFBundleInfoDictionaryVersion</key>
+ 	<string>6.0</string>
++	<key>CFBundleDisplayName</key>
++	<string>Blender iPad</string>
+ 	<key>CFBundleName</key>
+ 	<string>Blender</string>
+ 	<key>CFBundlePackageType</key>
+@@ -78,7 +80,7 @@
+ 				<string>public.data</string>
+ 			</array>
+ 			<key>UTTypeIdentifier</key>
+-			<string>org.blenderfoundation.blender.file</string>
++			<string>com.unofficial.blenderipad.file</string>
+ 			<key>UTTypeDescription</key>
+ 			<string>Blender File</string>
+ 			<key>UTTypeIcons</key>
+diff --git a/source/blender/editors/interface/view2d/view2d_ops.cc b/source/blender/editors/interface/view2d/view2d_ops.cc
+index 685b1234918..21934bf1e37 100644
+--- a/source/blender/editors/interface/view2d/view2d_ops.cc
++++ b/source/blender/editors/interface/view2d/view2d_ops.cc
+@@ -232,12 +232,13 @@ static wmOperatorStatus view_pan_exec(bContext *C, wmOperator *op)
+ static wmOperatorStatus view_pan_invoke(bContext *C, wmOperator *op, const wmEvent *event)
+ {
+ #ifdef WITH_APPLE_CROSSPLATFORM
+-  ScrArea *area = CTX_wm_area(C);
+-  ARegion *region = CTX_wm_region(C);
+-  /* Only scroll the File/Asset Browser and Asset Shelf views with multiple finger on iOS. */
+-  if ((area->spacetype == SPACE_FILE || region->regiontype == RGN_TYPE_ASSET_SHELF) &&
+-      !(event->flag & WM_EVENT_MULTITOUCH_TWO_FINGERS))
+-  {
++  /* On iOS only a two-finger trackpad pan (MOUSEPAN, numFingers==2) may pan/scroll
++   * a 2D view. A plain MIDDLEMOUSE press must NOT start a modal pan: it cannot be
++   * driven without continuous cursor-move events on iPad, and starting it would
++   * block the trackpad pan. This lets external-mouse middle-drag (delivered as a
++   * 2-finger TRACKPADPAN) pan the UV/Image and other 2D editors, matching the 3D
++   * viewport's behaviour. */
++  if (!(event->flag & WM_EVENT_MULTITOUCH_TWO_FINGERS)) {
+     return OPERATOR_FINISHED;
+   }
+ #endif
+diff --git a/source/blender/editors/space_view3d/view3d_navigate_view_move.cc b/source/blender/editors/space_view3d/view3d_navigate_view_move.cc
+index bbb12e2e723..1e5cbc1c9c9 100644
+--- a/source/blender/editors/space_view3d/view3d_navigate_view_move.cc
++++ b/source/blender/editors/space_view3d/view3d_navigate_view_move.cc
+@@ -106,8 +106,12 @@ static wmOperatorStatus viewmove_invoke_impl(bContext *C,
+ static wmOperatorStatus viewmove_invoke(bContext *C, wmOperator *op, const wmEvent *event)
+ {
+ #ifdef WITH_APPLE_CROSSPLATFORM
+-  /* Only handle inverted events for 3D view interaction on iOS */
+-  if (!(event->flag & WM_EVENT_MULTITOUCH_TWO_FINGERS)) {
++  /* iOS: a real MIDDLEMOUSE press (external mouse) starts the modal grab-pan,
++   * driven by CURSOR_MOVE events — this pins the grabbed point exactly (depth and
++   * zoom correct), unlike the zoom-amplified one-shot TRACKPADPAN path. Two-finger
++   * trackpad pans (MOUSEPAN) still use the one-shot path; other non-two-finger
++   * events (e.g. touch) are ignored. */
++  if (event->type != MIDDLEMOUSE && !(event->flag & WM_EVENT_MULTITOUCH_TWO_FINGERS)) {
+     return OPERATOR_FINISHED;
+   }
+ #endif

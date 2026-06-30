@@ -1,0 +1,113 @@
+# Build the unsigned Blender-iPad-Unofficial .ipa on a cloud macOS runner (no local Mac).
+#
+# Recipe adapted from the proven community workflow at
+# https://github.com/Toemeler/blender-iOS-ipa (which publishes working IPAs built from
+# blender/blender@ios). Adjusted to apply THIS repo's patch + custom icon/branding.
+# The exact iOS-library fetch and dylib-bundling details may still need tuning against
+# that reference on first run — compare if a step fails.
+#
+# Trigger: manually from the Actions tab, or by pushing a tag like v1.0.0.
+name: build-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # needed to attach the .ipa to a Release
+
+env:
+  BLENDER_COMMIT: d9b6fe34ddce527d93b97c0bf42ad92cebac4e4e
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 350   # a full Blender build is large
+
+    steps:
+      - name: Checkout this overlay repo
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      - name: Fetch Blender source at the pinned commit (with LFS)
+        run: |
+          git init blender
+          cd blender
+          git remote add origin https://projects.blender.org/blender/blender.git
+          git fetch --depth 1 origin "$BLENDER_COMMIT"
+          git checkout FETCH_HEAD
+          git lfs install
+          git lfs pull || true
+          echo "startup.blend bytes: $(wc -c < release/datafiles/startup.blend) (must be large, not ~131)"
+
+      - name: Cache iOS / host libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            blender/lib/ios_arm64
+            blender/lib/macos_arm64
+          key: blender-ios-libs-${{ env.BLENDER_COMMIT }}
+
+      - name: Fetch precompiled iOS libraries
+        working-directory: blender
+        run: |
+          python3 ./build_files/utils/make_update.py --no-blender --use-ios-libraries
+          test -d lib/ios_arm64 || { echo "::error::iOS libraries (lib/ios_arm64) missing"; exit 1; }
+
+      - name: Apply this repo's patch + custom icon/branding
+        run: |
+          cd blender
+          git apply ../overlay/patches/blender-ipad.patch
+          cp ../overlay/ios/icon/blender_icon.icns release/ios/Blender.app/Assets/blender_icon.icns
+
+      - name: Configure (iOS, Xcode generator)
+        run: |
+          cmake -S blender -B build_ios -G Xcode \
+            -DWITH_APPLE_CROSSPLATFORM=ON \
+            -DAPPLE_TARGET_DEVICE=ios \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.00 \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="" \
+            -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=""
+
+      - name: Build (Release, install target)
+        run: cmake --build build_ios --config Release --target install -- -quiet -jobs 3
+
+      - name: Package .ipa
+        run: |
+          APP="$(find build_ios -name Blender.app -type d | head -1)"
+          echo "app bundle: $APP"
+          test -n "$APP" || { echo "::error::Blender.app not found"; exit 1; }
+          # Bundle precompiled iOS dylibs into the app (mirrors the reference recipe).
+          LIBDST="$APP/Assets/lib"; mkdir -p "$LIBDST"
+          find blender/lib/ios_arm64 -name '*.dylib' \( -type f -o -type l \) -exec cp -fL {} "$LIBDST/" \; || true
+          find "$APP" -name 'libpython*.dylib' -exec cp -fn {} "$LIBDST/" \; || true
+          # iPad-Unofficial branding + iOS app icon (iOS ignores the .icns, so inject PNGs).
+          bash overlay/build/apply_branding.sh "$APP" overlay/ios/icon/icon_1024.png
+          codesign --force --deep --sign - "$APP" || true
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP" Payload/
+          find Payload -type l ! -exec test -e {} \; -delete || true
+          zip -qr Blender-iPad-Unofficial.ipa Payload
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blender-iPad-Unofficial-ipa
+          path: Blender-iPad-Unofficial.ipa
+          if-no-files-found: error
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" Blender-iPad-Unofficial.ipa \
+            --repo "${{ github.repository }}" \
+            --title "Blender iPad (Unofficial) $TAG" \
+            --notes "Unsigned IPA built from blender/blender@ios (${BLENDER_COMMIT}) + this repo's patch. Sideload with Sideloadly or AltStore/SideStore (free Apple ID = 7-day expiry). Unofficial build — not affiliated with the Blender Foundation."

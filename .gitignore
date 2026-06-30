@@ -1,0 +1,20 @@
+# Build artifacts — distribute the .ipa via GitHub Releases, not in the repo
+*.ipa
+*.app/
+Payload/
+build.log
+build_ios_xcode/
+
+# Icon build intermediates
+*.iconset/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editor / OS cruft
+*.swp
+*~
+Thumbs.db
