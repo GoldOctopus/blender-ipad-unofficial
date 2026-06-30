@@ -12,14 +12,12 @@ This project is an **independent, community-made modification** of Blender for i
 Please direct any bug reports, questions, or feedback about *this build* to **this repository**,
 never to the Blender Foundation or the official Blender bug tracker.
 
-## Relationship to the official project
+## Relationship to upstream Blender
 
-This project is a **community continuation** of Blender's own experimental iPad/iOS port, which
-the Blender Foundation paused. It is built **from** Blender's public `ios` branch and exists to
-credit and point back to that work — not to replace, impersonate, or imply endorsement by it:
+This project is built **from** Blender's public `ios` branch. It does not replace, impersonate, or
+imply endorsement by the Blender project.
 
 - Upstream source: https://projects.blender.org/blender/blender (branch `ios`)
-- Official status / discussion: https://devtalk.blender.org/t/request-precompiled-blender-ipad-ipa-for-non-mac-users/42287
 
 All original Blender copyright notices and credits are preserved; modifications are documented in
 [CHANGES.md](CHANGES.md).

@@ -10,13 +10,11 @@ usable on iPad.
 > Blender. See [TRADEMARK.md](TRADEMARK.md). Do **not** report issues from this build to the
 > Blender Foundation — open an issue here instead.
 
-This is a community **continuation of Blender's own experimental iPad/iOS effort**, which the
-Blender Foundation paused. It builds on Blender's `ios` branch and adds the input handling that
-was missing (external keyboard, mouse/trackpad, Apple Pencil) plus branding changes, distributed
-as a patch on top of upstream.
+This build is based on Blender's experimental `ios` branch and adds the input handling that was
+missing on iPad (external keyboard, mouse/trackpad, Apple Pencil), plus branding changes,
+distributed as a patch on top of upstream.
 
 - Upstream source: Blender `ios` branch — https://projects.blender.org/blender/blender
-- Background on the official (paused) effort: [Blender developer forum thread](https://devtalk.blender.org/t/request-precompiled-blender-ipad-ipa-for-non-mac-users/42287)
 - Build it yourself: [BUILD.md](BUILD.md)
 
 ---
