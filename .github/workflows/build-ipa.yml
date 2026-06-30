@@ -101,12 +101,18 @@ jobs:
           path: Blender-iPad-Unofficial.ipa
           if-no-files-found: error
 
-      - name: Publish Release
+      # Only tag pushes (e.g. v0.1.1) publish a Release — named by the tag.
+      # Manual runs (workflow_dispatch) stop after the artifact upload above, so they
+      # don't clutter Releases with build-N entries.
+      - name: Publish Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="build-${{ github.run_number }}"
+          TAG="${{ github.ref_name }}"
+          # Create the release if it's new; otherwise just (re)attach the IPA.
           gh release create "$TAG" Blender-iPad-Unofficial.ipa \
             --repo "${{ github.repository }}" \
             --title "Blender iPad (Unofficial) $TAG" \
-            --notes "Unsigned IPA built from blender/blender@ios (${BLENDER_COMMIT}) + this repo's patch. Sideload with Sideloadly or AltStore/SideStore (free Apple ID = 7-day expiry). Unofficial build — not affiliated with the Blender Foundation."
+            --notes "Unsigned IPA built from blender/blender@ios (${BLENDER_COMMIT}) + this repo's patch. Sideload with Sideloadly or AltStore/SideStore (free Apple ID = 7-day expiry). Unofficial build — not affiliated with the Blender Foundation." \
+          || gh release upload "$TAG" Blender-iPad-Unofficial.ipa --repo "${{ github.repository }}" --clobber
